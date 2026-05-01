@@ -63,7 +63,7 @@ Porque `read`/`write` normais fazem syscall por operação. io_uring submete um 
 
 ## Por que não serve pra nada?
 
-Serve. Só que exclusivamente como proxy de bytes sobre UDS. Sem TLS, sem HTTP, sem métricas, sem retry, sem health check, sem service discovery. Se você precisa de qualquer uma dessas coisas, use outro proxy.
+Serve. Só que exclusivamente como proxy de bytes sobre UDS. Sem TLS, sem métricas, sem retry, sem health check, sem service discovery. Se você precisa de qualquer uma dessas coisas, use outro proxy.
 
 Se você só quer empurrar bytes o mais rápido possível entre um TCP e um UDS, esse é o seu negócio.
 
