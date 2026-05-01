@@ -1,9 +1,9 @@
-use std::sync::Arc;
-
 use monoio::buf::{IoBuf, IoBufMut};
 use monoio::io::{AsyncReadRent, AsyncWriteRentExt, Splitable};
 use monoio::net::{TcpListener, TcpStream, UnixStream};
 use socket2::{Domain, Socket, Type};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn main() {
     let port: u16 = std::env::var("PORT")
@@ -24,21 +24,32 @@ fn main() {
             .filter(|s: &Arc<str>| !s.is_empty())
             .collect(),
     );
-    assert!(!upstreams.is_empty(), "UPSTREAMS must contain at least one path");
+    assert!(
+        !upstreams.is_empty(),
+        "UPSTREAMS must contain at least one path"
+    );
 
-    let n = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
+    let rr: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+
+    let n = std::env::var("WORKERS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+        });
 
     let handles: Vec<_> = (0..n)
         .map(|_| {
             let upstreams = upstreams.clone();
+            let rr = rr.clone();
             std::thread::spawn(move || {
                 monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
-                    .with_entries(4096)
+                    .with_entries(1024)
                     .build()
                     .expect("failed to build IoUring runtime")
-                    .block_on(accept_loop(port, buf_size, upstreams))
+                    .block_on(accept_loop(port, buf_size, upstreams, rr))
             })
         })
         .collect();
@@ -51,8 +62,6 @@ fn main() {
 fn make_listener(port: u16) -> std::net::TcpListener {
     let sock = Socket::new(Domain::IPV4, Type::STREAM, None).expect("socket2::Socket::new");
     sock.set_reuse_address(true).expect("SO_REUSEADDR");
-    // Each thread binds independently on the same port; the kernel distributes
-    // incoming SYNs across all per-thread queues with no userspace contention.
     sock.set_reuse_port(true).expect("SO_REUSEPORT");
     sock.set_nonblocking(true).expect("O_NONBLOCK");
     let addr: std::net::SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
@@ -61,16 +70,20 @@ fn make_listener(port: u16) -> std::net::TcpListener {
     sock.into()
 }
 
-async fn accept_loop(port: u16, buf_size: usize, upstreams: Arc<Vec<Arc<str>>>) {
+async fn accept_loop(
+    port: u16,
+    buf_size: usize,
+    upstreams: Arc<Vec<Arc<str>>>,
+    rr: Arc<AtomicUsize>,
+) {
     let listener = TcpListener::from_std(make_listener(port)).expect("TcpListener::from_std");
     let len = upstreams.len();
-    let mut rr: usize = 0;
     loop {
         match listener.accept().await {
             Ok((stream, _addr)) => {
                 stream.set_nodelay(true).ok();
-                let path = upstreams[rr % len].clone();
-                rr = rr.wrapping_add(1);
+                let idx = rr.fetch_add(1, Ordering::Relaxed) % len;
+                let path = upstreams[idx].clone();
                 monoio::spawn(handle_connection(stream, path, buf_size));
             }
             Err(_) => {}
