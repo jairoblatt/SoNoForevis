@@ -1,5 +1,5 @@
 use monoio::buf::{IoBuf, IoBufMut};
-use monoio::io::{AsyncReadRent, AsyncWriteRentExt, Splitable};
+use monoio::io::{AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt, Splitable};
 use monoio::net::{TcpListener, TcpStream, UnixStream};
 use socket2::{Domain, Socket, Type};
 use std::sync::Arc;
@@ -98,23 +98,42 @@ async fn handle_connection(tcp: TcpStream, uds_path: Arc<str>, buf_size: usize) 
     };
     let (tcp_r, tcp_w) = tcp.into_split();
     let (uds_r, uds_w) = uds.into_split();
+
+    // monoio::select! races both forward directions.
+    // When one side gets EOF, the select arm runs and we propagate
+    // the half-close to the opposite write half.
+    // Note: the losing future is cancelled and its writer is dropped,
+    // but drop of OwnedWriteHalf on monoio does NOT send FIN automatically
+    // in all cases. We explicitly shutdown the winning side's writer here
+    // to guarantee the peer sees EOF.
     monoio::select! {
-        _ = forward(tcp_r, uds_w, buf_size) => {}
-        _ = forward(uds_r, tcp_w, buf_size) => {}
+        _ = forward(tcp_r, uds_w, buf_size) => {
+            // client→backend direction finished
+            // No need to explicitly shutdown — uds_w was already consumed by forward().
+            // The other forward (uds_r, tcp_w) is cancelled; tcp_w will be dropped.
+        }
+        _ = forward(uds_r, tcp_w, buf_size) => {
+            // backend→client direction finished
+            // Same reasoning: tcp_w consumed, uds_w dropped.
+        }
     }
 }
 
 async fn forward<R, W>(mut reader: R, mut writer: W, buf_size: usize)
 where
     R: AsyncReadRent,
-    W: AsyncWriteRentExt,
+    W: AsyncWriteRent,
 {
     let mut buf: Box<[u8]> = vec![0u8; buf_size].into_boxed_slice();
     loop {
         let (res, slice) = reader.read(buf.slice_mut(..)).await;
         buf = slice.into_inner();
         let n = match res {
-            Ok(0) | Err(_) => return,
+            Ok(0) | Err(_) => {
+                // EOF or error — shutdown the write side to propagate close
+                let _ = writer.shutdown().await;
+                return;
+            }
             Ok(n) => n,
         };
         let (res, slice) = writer.write_all(buf.slice(0..n)).await;
